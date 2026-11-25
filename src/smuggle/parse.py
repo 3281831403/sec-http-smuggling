@@ -1,4 +1,10 @@
-"""HTTP request framing checks shared by a front-end proxy and its origin."""
+"""HTTP request framing checks shared by a front-end proxy and its origin.
+
+Both sides of a proxy/origin hop must derive exactly the same boundary for
+every request they accept.  Every rule below therefore fails closed: any
+ambiguity a sender could exploit to make the two parsers disagree is reported
+as a framing problem instead of being tolerated.
+"""
 
 from __future__ import annotations
 
@@ -40,17 +46,32 @@ def _header_values(headers, name):
     return _as_values(headers[name])
 
 
-def _is_chunked(values):
-    return any(value.strip().lower() == "chunked" for value in values)
+def check_chunk_size(line):
+    """Return the size encoded by one chunk-size line.
 
-
-def _chunk_header_width(line):
-    size_field = line.split(b";", 1)[0]
-    return len(size_field) + 2
+    Chunk extensions (``;name=value``) are framing metadata, not payload: they
+    are stripped here so the caller can locate the chunk data precisely.  The
+    size itself must be pure hexadecimal; anything else is rejected so a
+    decimal-only parser and a hex parser can never disagree on the boundary.
+    """
+    text = _to_text(line).strip()
+    token = text.split(";", 1)[0].strip()
+    if not token:
+        raise ValueError("empty chunk size")
+    for char in token:
+        if char not in HEX_CHARS:
+            raise ValueError("invalid chunk size")
+    return int(token, 16)
 
 
 def parse_headers(lines):
-    """Parse header lines into a mapping of names to every supplied value."""
+    """Parse header lines into a mapping of names to every supplied value.
+
+    Header names are case-insensitive in HTTP, so they are normalised to
+    lower case: ``Content-Length`` and ``content-length`` are the same
+    header and must be compared as such.  Repeated lines are retained in
+    order so conflicting duplicate values can be detected downstream.
+    """
     headers = {}
     for raw_line in lines:
         line = _to_text(raw_line).rstrip("\r\n")
@@ -59,46 +80,54 @@ def parse_headers(lines):
         if ":" not in line:
             raise ValueError("malformed header line")
         raw_name, raw_value = line.split(":", 1)
-        name = raw_name.strip()
+        name = raw_name.strip().lower()
+        if not name:
+            raise ValueError("malformed header line")
         value = raw_value.strip(" \t")
-        if name in headers:
-            continue
-        headers[name] = [value]
+        headers.setdefault(name, []).append(value)
     return headers
 
 
 def check_conflict(headers):
-    """Return framing problems caused by conflicting header values."""
+    """Return framing problems caused by conflicting header values.
+
+    Two rules are enforced:
+
+    * The same header appearing more than once with different values is a
+      conflict (identical duplicates are allowed).
+    * ``Content-Length`` and ``Transfer-Encoding`` must never appear
+      together: one side may honour the length header while the other
+      switches to chunked framing, which is the canonical request
+      smuggling disagreement.
+    """
     problems = []
     for name, raw_values in headers.items():
-        values = []
+        seen = []
         for value in _as_values(raw_values):
-            if value not in values:
-                values.append(value)
-        if len(values) > 1:
+            normalized = value.strip()
+            if normalized not in seen:
+                seen.append(normalized)
+        if len(seen) > 1:
             problems.append("conflicting values for " + _to_text(name))
 
     content_length = _header_values(headers, "content-length")
     transfer_encoding = _header_values(headers, "transfer-encoding")
-    if content_length and transfer_encoding and not _is_chunked(transfer_encoding):
+    if content_length and transfer_encoding:
         problems.append("conflicting framing headers")
     return problems
 
 
-def check_chunk_size(line):
-    """Return the size encoded by one chunk-size line."""
-    text = _to_text(line).strip()
-    token = text.split(";", 1)[0].strip()
-    if not token:
-        raise ValueError("empty chunk size")
-    for char in token:
-        if char not in HEX_CHARS:
-            raise ValueError("invalid chunk size")
-    return int(token, 10)
-
-
 def parse_chunked(body):
-    """Decode a chunked request body and return its payload bytes."""
+    """Decode a chunked request body and return its payload bytes.
+
+    The whole body must be consumed by the chunked framing: every chunk has
+    an exact hex size, chunk extensions are skipped rather than read as
+    data, each data chunk is followed by CRLF, and the body must finish with
+    exactly one zero-size chunk immediately followed by the terminating
+    empty line.  Any byte left over after that terminator would be the start
+    of a second request on a connection-persistent parser, so it is an
+    error rather than silently ignored data.
+    """
     data = _to_bytes(body)
     offset = 0
     payload = bytearray()
@@ -108,34 +137,48 @@ def parse_chunked(body):
             raise ValueError("missing chunk-size line")
         line = data[offset:line_end]
         size = check_chunk_size(line)
-        start = offset + _chunk_header_width(line)
+        # Skip the entire chunk-size line, including any ";extensions".
+        data_start = offset + len(line) + 2
         if size == 0:
+            # Empty chunk: the next line must be empty (no trailer section)
+            # and it must be the end of the body.
+            if data[data_start:data_start + 2] != b"\r\n":
+                raise ValueError("missing chunk terminator")
+            if data_start + 2 != len(data):
+                raise ValueError("data after final empty chunk")
             return bytes(payload)
-        end = start + size
+        end = data_start + size
         if end > len(data):
             raise ValueError("truncated chunk data")
-        payload.extend(data[start:end])
+        payload.extend(data[data_start:end])
         if data[end:end + 2] != b"\r\n":
             raise ValueError("missing chunk delimiter")
         offset = end + 2
 
 
 def check_terminator(body):
-    """Return whether a chunked body ends with an empty chunk."""
-    data = _to_bytes(body)
-    return data.endswith(b"0\r\n\r\n")
+    """Return whether a chunked body ends with exactly one empty chunk.
+
+    Delegates to :func:`parse_chunked` so there is a single definition of
+    the chunked boundary: a body accepted here is a body whose framing
+    parses cleanly end to end with nothing trailing.
+    """
+    try:
+        parse_chunked(body)
+    except ValueError:
+        return False
+    return True
 
 
 def verify_body(body, declared):
-    """Return whether a body agrees with its declared length."""
+    """Return whether a body agrees with its declared length exactly."""
     try:
         expected = int(declared)
     except (TypeError, ValueError):
         return False
     if expected < 0:
         return False
-    actual = len(_to_bytes(body))
-    return (actual > 0) == (expected > 0)
+    return len(_to_bytes(body)) == expected
 
 
 def _request_headers(request):
@@ -144,7 +187,10 @@ def _request_headers(request):
     else:
         raw_headers = request
     if isinstance(raw_headers, dict):
-        return {str(name): _as_values(values) for name, values in raw_headers.items()}
+        return {
+            str(name).strip().lower(): _as_values(values)
+            for name, values in raw_headers.items()
+        }
     return parse_headers(raw_headers)
 
 
@@ -183,24 +229,28 @@ def _validate_parts(headers, body):
             parse_chunked(body)
         except ValueError:
             problems.append("invalid chunked body")
-        if b"0\r\n\r\n" not in body:
+        if not check_terminator(body):
             problems.append("chunked body is missing a terminating empty chunk")
     return problems
 
 
 def validate_request(request):
-    """Return the framing problems found in one request."""
+    """Return the framing problems found in one request.
+
+    Pure and deterministic: validating the same request twice always yields
+    the same result, and no state is shared between calls.
+    """
     headers, body = _request_parts(request)
     return _validate_parts(headers, body)
 
 
 def smuggle_batch(requests):
-    """Validate several requests and return results keyed by position."""
+    """Validate several requests and return results keyed by position.
+
+    Each request is validated independently with its own headers and body;
+    one request's framing can never influence the verdict of another.
+    """
     results = {}
-    cached_headers = None
     for index, request in enumerate(requests):
-        body = _request_body(request)
-        if cached_headers is None:
-            cached_headers = _request_headers(request)
-        results[index] = _validate_parts(cached_headers, body)
+        results[index] = validate_request(request)
     return results
